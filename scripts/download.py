@@ -34,6 +34,9 @@ def download_images(df_chunk, url_root, dataset_name):
 df = pd.read_csv("data/ammonitor/metadata.csv")
 df.drop_duplicates("path", inplace=True)
 
+# TEMPORARY
+df = df[df["confidence"].notna()]
+
 chunks = list(chunk_dataframe(df, num_chunks=6)) 
 threads = []
 url_root = "https://lilawildlife.blob.core.windows.net/lila-wildlife/ammonitor-camera-traps/"  # Replace with the actual URL root
