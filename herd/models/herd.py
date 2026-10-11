@@ -1,18 +1,27 @@
 import torch
 import torch.nn as nn
-
+import numpy as np
 import open_clip
 
+from torchvision.ops import box_convert
 from pytorch_lightning import LightningModule
 
 from lightly.models.utils import deactivate_requires_grad, get_weight_decay_parameters
 from lightly.utils.debug import std_of_l2_normalized
+from lightly.loss.ntx_ent_loss import NTXentLoss
 
 from transformers import CLIPTextModel, CLIPTokenizer
 
+from motrackers import CentroidKF_Tracker
+
 class Herd(LightningModule):
-    def __init__(self,):
+    def __init__(self, labels, transform):
         super().__init__()
+        
+        self.transform = transform
+        self.labels = labels
+        input_dim = 768
+        text_dim = 512
         
         # Species Level Embedding
         self.species_encoder, _, _ = open_clip.create_model_and_transforms('hf-hub:imageomics/bioclip-2')
@@ -20,7 +29,7 @@ class Herd(LightningModule):
         deactivate_requires_grad(self.species_encoder)
         
         # Position Level Embedding
-        self.position_embedding = nn.Linear(4, 768)
+        self.position_embedding = nn.Linear(4, input_dim)
         
         # Bounding Box Level Embedding
         self.bbox_encoder = None
@@ -30,31 +39,33 @@ class Herd(LightningModule):
         tokenizer = CLIPTokenizer.from_pretrained(text_model_name)
         self.text_encoder = CLIPTextModel.from_pretrained(text_model_name)
         deactivate_requires_grad(self.text_encoder)
+        with torch.no_grad():
+            inputs = tokenizer(labels, padding=True, return_tensors="pt")
+            outputs = self.text_encoder(**inputs)
+            text_embeddings = outputs.pooler_output # Shape: [num_labels, 512]
+        self.text_embeddings = {}
+        for idx, label in enumerate(labels):
+            self.text_embeddings[label] = text_embeddings[idx]
+                    
         
         # Fusion Layer
-        self.mha = nn.MultiheadAttention(embed_dim=768, num_heads=8, batch_first=True, dropout=0.1)
-        self.layer_norm = nn.LayerNorm(768)
-        self.pool_v = nn.Linear(input_dim, 256)
-        self.pool_u = nn.Linear(input_dim, 256)
+        self.mha = nn.MultiheadAttention(embed_dim=input_dim*2, num_heads=8, batch_first=True, dropout=0.1)
+        self.layer_norm = nn.LayerNorm(input_dim*2)
+        self.pool_v = nn.Linear(input_dim*2, 256)
+        self.pool_u = nn.Linear(input_dim*2, 256)
         self.pool_w = nn.Linear(256, 1)
         self.projection = nn.Sequential(
-            nn.Linear(input_dim, text_dim),
+            nn.Linear(input_dim*2, text_dim),
             nn.LayerNorm(text_dim)
         )
         
-    def forward(self, images, positions):
-        # Extract instance features
-        with torch.no_grad():
-            species_features = self.species_encoder(images) # Shape: [num_animals, 768]
+        self.criterion = NTXentLoss(temperature=0.5)
         
-        # Add positional embeddings
-        pos_embeds = self.position_embedding(positions) # Shape: [num_animals, 768]
-        x = species_features + pos_embeds
-        
+    def forward(self, features):
         # MIL Attention Layer
-        x_seq = x.unsqueeze(0) # [1, N, 768]
+        x_seq = features.unsqueeze(0) # [1, N, 768]
         attn_out, _ = self.mha(x_seq, x_seq, x_seq) # Self-attention across instances [1, N, 768]
-        x = self.layer_norm(x + attn_out.squeeze(0)) # Residual connection [N, 768]
+        x = self.layer_norm(features + attn_out.squeeze(0)) # Residual connection [N, 768]
         
         # Gated MIL Pooling
         # This decides which refined animal features represent the species best
@@ -68,14 +79,33 @@ class Herd(LightningModule):
         return self.projection(bag_latent.unsqueeze(0)).squeeze(0) # [512]
     
     def training_step(self, batch, batch_index):
-        images, positions, labels = batch[0], batch[1], batch[2]
-        batch_size = images.shape[0]
+        frames, bboxes, confidence, labels = batch[0], batch[1], batch[2], batch[3]
+        # frames.shape # [Batch, Frames, Channels, Height, Width]
+        # bboxes.shape # [Batch, Frames, Crops, 4]
+        # labels # [Batch, Frames, Labels]
+        
+        
+        for i in range(len(frames)):
+            tracer = self.tracker(frames[i], bboxes[i], confidence[i], labels[i])
+            features, text_features = self.feature_fusion(tracer)
+            
+            bag_latent = self.forward(features)
+            
+            print(features.shape, text_features.shape)
+            loss = self.criterion(bag_latent, text_features)
+            print(loss)
+
+            
+            
+        features = torch.stack(features)
+        text_features = torch.stack(text_features)
         
         bag_latent = []
-        for img, pos in zip(images, positions):
-            output = self.forward(img, pos)
+        for f in features:
+            output = self.forward(f)
             bag_latent.append(output)
         bag_latent = torch.stack(bag_latent)
+        print(bag_latent.shape)
         
         text_embeddings = torch.stack([self.text_embeddings[label.item()] for label in labels]).to(bag_latent.device)
         
@@ -86,6 +116,65 @@ class Herd(LightningModule):
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
         self.log("representation_std", representation_std, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
         return loss
+    
+    def crop_image(self, frame, bboxe):
+        width, height = frame.size
+        bbox = box_convert(torch.tensor([bboxe]), in_fmt="xywh", out_fmt="xyxy").numpy()[0]
+        bbox[0], bbox[1], bbox[2], bbox[3] = bbox[0]*width, bbox[1]*height, bbox[2]*width, bbox[3]*height
+        return self.transform(frame.crop(bbox)).to(self.device)
+    
+    def tracker(self, frames, bboxes, confidence, labels):
+        tracker = CentroidKF_Tracker()
+        
+        tracer = {}
+        for frame, frame_bboxes, frame_confidence, frame_labels in zip(frames, bboxes, confidence, labels):
+            tracks = tracker.update(
+                bboxes=frame_bboxes, 
+                detection_scores=frame_confidence,
+                class_ids=[self.labels.index(label) for label in frame_labels]
+            )
+            
+            id_to_class_map = {t: tracker.tracks[t].class_id for t in tracker.tracks}
+
+            for t in tracks:
+                # t format: [frame_idx_1based, track_id, xmin, ymin, width, height, confidence]
+                track_id = int(t[1])
+                if track_id not in tracer:
+                    tracer[track_id] = {
+                        "crops": [],
+                        "bboxes": [],
+                        "labels": []
+                    }
+                
+                xmin, ymin, width, height = t[2:6]
+                class_id = id_to_class_map[t[1]]
+                crop = self.crop_image(frame, [xmin, ymin, width, height])
+                tracer[track_id]["crops"].append(crop)
+                bbox = box_convert(torch.tensor([xmin, ymin, width, height], dtype=torch.float32), in_fmt="xywh", out_fmt="cxcywh")
+                tracer[track_id]["bboxes"].append(bbox)
+                tracer[track_id]["labels"].append(self.labels[class_id])
+                tracer[track_id]["labels"] = np.unique(tracer[track_id]["labels"]).tolist()
+                
+        return tracer
+    
+    def feature_fusion(self, tracer):
+        features, text_features = [], []
+        for track_id, track_data in tracer.items():
+            crops = torch.stack(track_data["crops"])
+            bboxes = torch.stack(track_data["bboxes"]).to(self.device)
+            # Example fusion: average the features of all crops for this track
+            species_features = self.species_encoder(crops).mean(dim=0)
+            position_features = self.position_embedding(bboxes).mean(dim=0)
+            feats = torch.concat([species_features, position_features])
+            features.append(feats)
+            
+            text_embeddings = torch.stack([self.text_embeddings[label] for label in track_data["labels"]]).to(self.device)
+            text_features.append(text_embeddings[0])
+        features = torch.stack(features)
+        text_features = torch.stack(text_features)
+        
+        return features, text_features
+    
     
     def get_params(self):
             params, params_no_weight_decay = get_weight_decay_parameters(
