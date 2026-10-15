@@ -49,13 +49,13 @@ class Herd(LightningModule):
                     
         
         # Fusion Layer
-        self.mha = nn.MultiheadAttention(embed_dim=input_dim*2, num_heads=8, batch_first=True, dropout=0.1)
-        self.layer_norm = nn.LayerNorm(input_dim*2)
-        self.pool_v = nn.Linear(input_dim*2, 256)
-        self.pool_u = nn.Linear(input_dim*2, 256)
+        self.mha = nn.MultiheadAttention(embed_dim=input_dim, num_heads=8, batch_first=True, dropout=0.1)
+        self.layer_norm = nn.LayerNorm(input_dim)
+        self.pool_v = nn.Linear(input_dim, 256)
+        self.pool_u = nn.Linear(input_dim, 256)
         self.pool_w = nn.Linear(256, 1)
         self.projection = nn.Sequential(
-            nn.Linear(input_dim*2, text_dim),
+            nn.Linear(input_dim, text_dim),
             nn.LayerNorm(text_dim)
         )
         
@@ -84,37 +84,27 @@ class Herd(LightningModule):
         # bboxes.shape # [Batch, Frames, Crops, 4]
         # labels # [Batch, Frames, Labels]
         
+        batch_size = len(frames)
         
+        visual_features, text_features = [], []
         for i in range(len(frames)):
             tracer = self.tracker(frames[i], bboxes[i], confidence[i], labels[i])
-            features, text_features = self.feature_fusion(tracer)
+            visual_feats, text_feats = self.feature_fusion(tracer)
             
-            bag_latent = self.forward(features)
+            bag_latent = self.forward(visual_feats)
             
-            print(features.shape, text_features.shape)
-            loss = self.criterion(bag_latent, text_features)
-            print(loss)
-
+            visual_features.append(bag_latent.repeat(len(visual_feats), 1))
+            text_features.append(text_feats)
             
-            
-        features = torch.stack(features)
-        text_features = torch.stack(text_features)
+        loss = torch.tensor(0.0, device=bag_latent.device)
+        for visual_feats, text_feats in zip(visual_features, text_features):
+            loss += self.criterion(visual_feats, text_feats)
+        loss = loss / len(visual_features) 
         
-        bag_latent = []
-        for f in features:
-            output = self.forward(f)
-            bag_latent.append(output)
-        bag_latent = torch.stack(bag_latent)
-        print(bag_latent.shape)
-        
-        text_embeddings = torch.stack([self.text_embeddings[label.item()] for label in labels]).to(bag_latent.device)
-        
-        representation_std = std_of_l2_normalized(bag_latent)
-        
-        loss = self.criterion(bag_latent, text_embeddings)
+        #representation_std = std_of_l2_normalized(bag_latent)
         
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
-        self.log("representation_std", representation_std, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
+        #self.log("representation_std", representation_std, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
         return loss
     
     def crop_image(self, frame, bboxe):
@@ -147,6 +137,8 @@ class Herd(LightningModule):
                     }
                 
                 xmin, ymin, width, height = t[2:6]
+                if width <= 0 or height <= 0:
+                    continue
                 class_id = id_to_class_map[t[1]]
                 crop = self.crop_image(frame, [xmin, ymin, width, height])
                 tracer[track_id]["crops"].append(crop)
@@ -164,12 +156,13 @@ class Herd(LightningModule):
             bboxes = torch.stack(track_data["bboxes"]).to(self.device)
             # Example fusion: average the features of all crops for this track
             species_features = self.species_encoder(crops).mean(dim=0)
-            position_features = self.position_embedding(bboxes).mean(dim=0)
-            feats = torch.concat([species_features, position_features])
-            features.append(feats)
+            # position_features = self.position_embedding(bboxes).mean(dim=0)
+            # feats = torch.concat([species_features, position_features])
+            features.append(species_features)
             
             text_embeddings = torch.stack([self.text_embeddings[label] for label in track_data["labels"]]).to(self.device)
-            text_features.append(text_embeddings[0])
+            text_embeddings = text_embeddings.mean(dim=0)
+            text_features.append(text_embeddings)
         features = torch.stack(features)
         text_features = torch.stack(text_features)
         

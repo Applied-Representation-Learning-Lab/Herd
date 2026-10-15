@@ -13,6 +13,7 @@ df = pd.read_csv("data/ammonitor/metadata.csv")
 # get all the downloaded images first
 paths = [os.path.join(root.split(os.sep)[-1], fname) for root, _, fnames in os.walk("data/ammonitor/images") for fname in fnames]
 df = df[df["path"].isin(paths)]
+df = df[df["label"]!="empty"]
 labels = df["label"].unique().tolist()
 
 TRAIN_TRANSFORM = SimCLRViewTransform()

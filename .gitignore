@@ -2,3 +2,4 @@ data/
 .venv/
 metadata/
 lightning_logs/
+tmp/
