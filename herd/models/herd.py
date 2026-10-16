@@ -74,9 +74,10 @@ class Herd(LightningModule):
         weights = torch.softmax(self.pool_w(v * u), dim=0) # [N, 1]
         
         bag_latent = (x * weights).sum(dim=0) # [768]
+        instances = self.projection(x)
         
         # Project to match CLIP Text dimension
-        return self.projection(bag_latent.unsqueeze(0)).squeeze(0) # [512]
+        return self.projection(bag_latent.unsqueeze(0)).squeeze(0), instances, weights
     
     def training_step(self, batch, batch_index):
         frames, bboxes, confidence, labels = batch[0], batch[1], batch[2], batch[3]
@@ -91,7 +92,7 @@ class Herd(LightningModule):
             tracer = self.tracker(frames[i], bboxes[i], confidence[i], labels[i])
             visual_feats, text_feats = self.feature_fusion(tracer)
             
-            bag_latent = self.forward(visual_feats)
+            bag_latent, _, _ = self.forward(visual_feats)
             
             visual_features.append(bag_latent.repeat(len(visual_feats), 1))
             text_features.append(text_feats)
@@ -127,10 +128,11 @@ class Herd(LightningModule):
             id_to_class_map = {t: tracker.tracks[t].class_id for t in tracker.tracks}
 
             for t in tracks:
-                # t format: [frame_idx_1based, track_id, xmin, ymin, width, height, confidence]
+                # t format: [frame_idx, track_id, xmin, ymin, width, height, confidence]
                 track_id = int(t[1])
                 if track_id not in tracer:
                     tracer[track_id] = {
+                        "frame_idx": [],
                         "crops": [],
                         "bboxes": [],
                         "labels": []
@@ -146,6 +148,7 @@ class Herd(LightningModule):
                 tracer[track_id]["bboxes"].append(bbox)
                 tracer[track_id]["labels"].append(self.labels[class_id])
                 tracer[track_id]["labels"] = np.unique(tracer[track_id]["labels"]).tolist()
+                tracer[track_id]["frame_idx"].append(int(t[0]))
                 
         return tracer
     

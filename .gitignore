@@ -3,3 +3,5 @@ data/
 metadata/
 lightning_logs/
 tmp/
+results/
+checkpoints/
